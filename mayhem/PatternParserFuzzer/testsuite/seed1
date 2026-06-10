@@ -1,0 +1,1 @@
+mylogger\|hello world\|%d %-5p %c{1} - %m%n

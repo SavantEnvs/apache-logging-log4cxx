@@ -1,0 +1,1 @@
+a\|b\|%d{ISO8601} %c %p %m%n %throwable

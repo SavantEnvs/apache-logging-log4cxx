@@ -1,0 +1,14 @@
+project: savantenvs/apache-logging-log4cxx
+target: PatternLayoutFuzzer
+# Seeds, canonical two-entry form (docs/seed-corpus.md): the server tar is REQUIRED or the corpus
+# never accumulates (#124), and the local path must be RELATIVE and per-target — an absolute
+# file:/// aborts run-creation (#158). NOTE: the comment must live on its OWN line, never inline
+# on the `testsuite:` key, which aborts run-creation with a bare 'Oops, something went wrong'.
+# mayhem-lint: keep-testsuite
+testsuite:
+  - https://$MAYHEM_DOMAIN/$MAYHEM_PROJECT/$MAYHEM_TARGET/testsuite.tar
+  - file://mayhem/PatternLayoutFuzzer/testsuite
+cmds:
+  - cmd: /mayhem/PatternLayoutFuzzer
+    libfuzzer: true
+    cwd: /dev/shm

@@ -1,0 +1,55 @@
+# libFuzzer dictionary for the log4cxx conversion-pattern parser
+# (PatternParser::parse). Conversion specifiers + format modifiers from
+# the converter rule map in PatternParserFuzzer.cpp.
+
+# conversion characters
+"%c"
+"%C"
+"%d"
+"%F"
+"%l"
+"%L"
+"%m"
+"%M"
+"%n"
+"%p"
+"%r"
+"%t"
+"%T"
+"%x"
+"%X"
+"%%"
+
+# long-form keywords
+"%logger"
+"%class"
+"%date"
+"%file"
+"%line"
+"%message"
+"%method"
+"%level"
+"%relative"
+"%thread"
+"%threadname"
+"%ndc"
+"%properties"
+"%throwable"
+
+# date/option braces
+"{ISO8601}"
+"{ABSOLUTE}"
+"{DATE}"
+"{HH:mm:ss}"
+"{yyyy-MM-dd}"
+"{1}"
+"{2}"
+"{user}"
+
+# format modifiers
+"-"
+"."
+"%-5p"
+"%-20.30c"
+"%5.10p"
+"%.40m"

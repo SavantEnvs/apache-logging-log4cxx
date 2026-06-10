@@ -1,0 +1,80 @@
+# libFuzzer dictionary for log4cxx DOMConfigurator XML config parsing.
+# Element/attribute tokens harvested from src/test/resources/input/xml/*.xml plus the
+# log4cxx/log4j XML DTD vocabulary (DOMConfigurator::configure → expat).
+
+# DOCTYPE / namespace
+"<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+"<!DOCTYPE"
+"log4j:configuration"
+"xmlns:log4j"
+"http://jakarta.apache.org/log4j/"
+"http://logging.apache.org/"
+
+# elements
+"<configuration"
+"<appender"
+"<appender-ref"
+"<layout"
+"<filter"
+"<errorHandler"
+"<logger"
+"<root"
+"<level"
+"<priority"
+"<category"
+"<param"
+"<rollingPolicy"
+"<triggeringPolicy"
+"<connectionSource"
+
+# attributes
+"name="
+"value="
+"class="
+"ref="
+"debug="
+"threshold="
+"additivity="
+
+# common param names
+"ConversionPattern"
+"File"
+"Append"
+"BufferSize"
+"MaxFileSize"
+"MaxBackupIndex"
+"LocationInfo"
+"Target"
+"Threshold"
+"AcceptOnMatch"
+"LevelToMatch"
+"LevelMin"
+"LevelMax"
+
+# class names
+"org.apache.log4j.ConsoleAppender"
+"org.apache.log4j.FileAppender"
+"org.apache.log4j.RollingFileAppender"
+"org.apache.log4j.PatternLayout"
+"org.apache.log4j.SimpleLayout"
+"org.apache.log4j.xml.XMLLayout"
+"org.apache.log4j.HTMLLayout"
+"org.apache.log4j.varia.LevelRangeFilter"
+
+# levels
+"TRACE"
+"DEBUG"
+"INFO"
+"WARN"
+"ERROR"
+"FATAL"
+"ALL"
+"OFF"
+
+# closing
+"/>"
+"</appender>"
+"</layout>"
+"</logger>"
+"</root>"
+"</log4j:configuration>"
