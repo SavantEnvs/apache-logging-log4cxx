@@ -1,0 +1,327 @@
+# The Mayhem worker for a BUG-MINING branch (mine-<BASE7>): one additive commit (the mayhem/ layer) on the
+# upstream commit before a candidate fix. Build the commit image from mayhem/Dockerfile, push it to ghcr,
+# then run Mayhem over mayhem/Mayhemfile* (listed at run time), in the dispatch's mode:
+#   - regression (the default): with `replay=https://app.mayhem.security/<org>/<project>/<target>/<run>`,
+#     that run's crashers, downloaded onto the runner (never into the branch or the image), replayed on
+#     the Mayhemfile of that target via `--testsuite file://<them> --regression` — no fuzzing, no
+#     duration. Without `replay` it only builds the image (for a hand-in `mayhem run`, MINING.md step 5).
+#     With `image=fix` it also builds the same layer on FIX (the rlenv.fix label) and replays on
+#     `<tgt>-fixed-<BASE7>` instead (MINING.md step 6: the bug must be gone there);
+#   - fuzz: seeded with the corpus of the live target named by the Mayhemfile's optional `# seed-from:`
+#     line (downloaded onto the runner) plus its committed seeds, for `duration` seconds.
+# Runs only on an explicit dispatch; no cron, no push trigger:
+#   gh workflow run mayhem.yml --ref mine-<BASE7> [-f replay=<run url> [-f image=fix]]
+#   gh workflow run mayhem.yml --ref mine-<BASE7> -f mode=fuzz [-f duration=300] [-f target=<target>]
+name: Mayhem
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'regression (replay the `replay` run''s crashers; build only without one) or fuzz.'
+        type: choice
+        options: [regression, fuzz]
+        default: regression
+      replay:
+        description: 'regression: the run whose crashers to replay, https://app.mayhem.security/<org>/<project>/<target>/<run>.'
+        type: string
+        required: false
+        default: ''
+      image:
+        description: 'regression: replay on the layer on BASE (base) or on FIX (fix, as <tgt>-fixed-<BASE7>).'
+        type: choice
+        options: [base, fix]
+        default: base
+      duration:
+        description: 'Fuzzing duration in seconds per target (FUZZ mode only).'
+        type: string
+        required: false
+        default: '300'
+      target:
+        description: 'fuzz: run only this mined target (default: every Mayhemfile).'
+        type: string
+        required: false
+        default: ''
+  workflow_call:                   # kept for the shared spec contract; nothing calls it (no sync.yml)
+    inputs:
+      mode:
+        description: regression or fuzz
+        type: string
+        required: false
+        default: regression
+      replay:
+        description: the run whose crashers to replay (regression)
+        type: string
+        required: false
+        default: ''
+      image:
+        description: base or fix (regression)
+        type: string
+        required: false
+        default: base
+      duration:
+        description: fuzzing duration in seconds per target (FUZZ mode only)
+        type: string
+        required: false
+        default: '300'
+      target:
+        description: run only this mined target (fuzz)
+        type: string
+        required: false
+        default: ''
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:                           # first in the file: spec-check reads the FIRST checkout's fetch-depth
+    name: build commit image
+    needs: mayhemfiles             # a mistyped `target` fails before the image is built
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 0          # the Dockerfile COPYs .git into /mayhem: the image needs full history
+
+      - name: Resolve build SHA
+        id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: type=raw,value=commit-${{ steps.sha.outputs.sha }}
+
+      - name: Already in the registry?   # the tag names everything that went into the image
+        id: have
+        env:
+          IMG: ${{ steps.meta.outputs.tags }}
+        run: |
+          if docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$IMG is already in the registry: not built again"
+          fi
+
+      - name: Build and push (mayhem/Dockerfile)
+        if: steps.have.outputs.hit != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: mayhem/Dockerfile
+          push: true
+          build-args: |
+            COMMIT=${{ steps.sha.outputs.sha }}
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+      ref: ${{ steps.sha.outputs.sha }}
+
+  build-fix:
+    name: build fix image (the layer on FIX)
+    needs: mayhemfiles
+    if: ${{ inputs.image == 'fix' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Put the layer on FIX
+        id: sha
+        run: |
+          head=$(git rev-parse HEAD)
+          fix=$(sed -nE 's/^[[:space:]]*rlenv\.fix="([0-9a-f]{40})".*/\1/p' mayhem/Dockerfile | head -1)
+          [ -n "$fix" ] || { echo "::error::mayhem/Dockerfile has no rlenv.fix=\"<40 hex>\" label"; exit 1; }
+          git checkout -q "$fix" && git checkout -q "$head" -- mayhem/ && git submodule update -q --init --recursive
+          echo "head=$head" >> "$GITHUB_OUTPUT"
+          echo "fix=$fix" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5.10.0
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: type=raw,value=fix-${{ steps.sha.outputs.head }}
+
+      - name: Already in the registry?   # the tag names everything that went into the image
+        id: have
+        env:
+          IMG: ${{ steps.meta.outputs.tags }}
+        run: |
+          if docker buildx imagetools inspect "$IMG" >/dev/null 2>&1; then
+            echo "hit=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::$IMG is already in the registry: not built again"
+          fi
+
+      - name: Build and push (mayhem/Dockerfile on FIX)
+        if: steps.have.outputs.hit != 'true'
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+        with:
+          context: .
+          file: mayhem/Dockerfile
+          push: true
+          build-args: |
+            COMMIT=${{ steps.sha.outputs.fix }}
+            REPO_URL=${{ github.server_url }}/${{ github.repository }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+
+  mayhemfiles:
+    name: list Mayhemfiles
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.ls.outputs.matrix }}
+      any: ${{ steps.ls.outputs.any }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: One matrix entry per mayhem/Mayhemfile* (fuzz; only `target`'s, if given) or the `replay` run's
+        id: ls
+        env:
+          MODE: ${{ inputs.mode || 'regression' }}
+          REPLAY: ${{ inputs.replay }}
+          TARGET: ${{ inputs.target }}
+          IMAGE: ${{ inputs.image || 'base' }}
+        run: |
+          case "$IMAGE" in
+            base) ;;
+            fix) [ "$MODE" = regression ] && [ -n "$REPLAY" ] || { echo "::error::image=fix replays a run: mode=regression with replay"; exit 1; } ;;
+            *) echo "::error::image '$IMAGE' is not base or fix"; exit 1 ;;
+          esac
+          case "$MODE" in
+            fuzz) [ -z "$REPLAY" ] || { echo "::error::replay is for mode=regression, not fuzz"; exit 1; } ;;
+            regression)
+              o=$(sed -nE 's|^https://app\.mayhem\.security/([^/[:space:]]+/[^/[:space:]]+/[^/[:space:]]+/[0-9]+)$|\1|p' <<<"$REPLAY")
+              [ -n "$o" ] || [ -z "$REPLAY" ] || { echo "::error::replay '$REPLAY' is not https://app.mayhem.security/<org>/<project>/<target>/<run>"; exit 1; }
+              TARGET=""; rt=$(cut -d/ -f3 <<<"$o") ;;
+            *) echo "::error::mode '$MODE' is not regression or fuzz"; exit 1 ;;
+          esac
+          m=$(for f in mayhem/Mayhemfile*; do
+                t=$(sed -nE 's/^[[:space:]]*target:[[:space:]]*"?([^"[:space:]]+)"?.*/\1/p' "$f" | head -1)
+                s=$(sed -nE 's|^#[[:space:]]*seed-from:[[:space:]]*https://app\.mayhem\.security/([^/[:space:]]+/[^/[:space:]]+/[^/[:space:]]+)[[:space:]]*$|\1|p' "$f" | head -1)
+                case "$t" in *-mined-*) ;; *) echo "::error file=$f::target '$t' lacks the -mined-<BASE7> suffix (it would run a live target)"; exit 1;; esac
+                slug=$(tr '[:upper:]' '[:lower:]' <<<"$t" | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//')
+                if [ "$MODE" = regression ]; then [ -n "$o" ] && [ "$slug" = "$rt" ] || continue
+                elif [ -n "$TARGET" ] && [ "$t" != "$TARGET" ]; then continue; fi
+                [ "$IMAGE" = fix ] && t="${t%-mined-*}-fixed-${t##*-mined-}"
+                printf '%s\t%s\t%s\t%s\n' "$f" "$t" "$s" "$o"
+              done | jq -R -s -c '{include: split("\n") | map(select(length > 0) | split("\t") | {mayhemfile: .[0], target: .[1], seedfrom: .[2], replay: .[3]})}')
+          if [ "$(jq '.include | length' <<<"$m")" -eq 0 ]; then
+            if [ "$MODE" = regression ] && [ -z "$o" ]; then echo "no replay: building the image only"
+            elif [ "$MODE" = regression ]; then echo "::error::no mayhem/Mayhemfile* has the target of $REPLAY"; exit 1
+            else echo "::error::no mayhem/Mayhemfile* has target '$TARGET'"; exit 1; fi
+          fi
+          echo "matrix=$m" >> "$GITHUB_OUTPUT"
+          echo "any=$(jq '.include | length > 0' <<<"$m")" >> "$GITHUB_OUTPUT"
+
+  mayhem:
+    needs: [build, build-fix, mayhemfiles]
+    # regression without `replay` builds only; build-fix is skipped unless image=fix
+    if: ${{ !cancelled() && needs.mayhemfiles.outputs.any == 'true' && needs.build.result == 'success' && needs.build-fix.result != 'failure' }}
+    name: '${{ matrix.replay && ''replay'' || ''fuzz'' }} ${{ matrix.target }}'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.mayhemfiles.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          ref: ${{ needs.build.outputs.ref }}
+
+      # ── FUZZ: mode=fuzz ─────────────────────────────────────────────────────────────────────────
+      - name: Seeds from ${{ matrix.seedfrom }} and the committed testsuite
+        if: ${{ !matrix.replay }}
+        shell: bash
+        env:
+          MAYHEM_TOKEN: ${{ secrets.MAYHEM_TOKEN }}
+          SEEDFROM: ${{ matrix.seedfrom }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          d="$RUNNER_TEMP/seeds" && mkdir -p "$d"
+          if [ -n "$SEEDFROM" ]; then
+            IFS=/ read -r org project target <<<"$SEEDFROM"
+            # to a file, not piped: Mayhem pads the tar past its end-of-archive marker
+            curl -fsSL --retry 3 -H "X-Mayhem-Token: token $MAYHEM_TOKEN" -o "$RUNNER_TEMP/seeds.tar" \
+              "https://app.mayhem.security/api/v2/owner/$org/project/$project/target/$target/testsuite.tar"
+            tar -x -C "$d" -f "$RUNNER_TEMP/seeds.tar"
+          fi
+          if [ -d "mayhem/$TARGET/testsuite" ]; then cp -r "mayhem/$TARGET/testsuite/." "$d/"; fi
+          n=$(find "$d" -type f | wc -l)
+          [ "$n" -gt 0 ] || { echo "::error::no seeds for $TARGET"; exit 1; }
+          echo "$n seed file(s) for $TARGET (live corpus: ${SEEDFROM:-none})"
+      - name: Fuzz the old commit (${{ matrix.target }})
+        if: ${{ !matrix.replay }}
+        uses: ForAllSecure/mcode-action@08516a896b38a6d4955bceb640c21908ec0c416b # v1.0.12
+        with:
+          mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
+          args: --image ${{ needs.build.outputs.image }} --file ${{ matrix.mayhemfile }} --testsuite file://${{ runner.temp }}/seeds --duration ${{ inputs.duration || '300' }}
+
+      # ── REPLAY: mode=regression, `replay` names the run ────────────────────────────────────────
+      - name: Download the crashers of ${{ matrix.replay }}
+        if: ${{ matrix.replay }}
+        shell: bash
+        env:
+          MAYHEM_TOKEN: ${{ secrets.MAYHEM_TOKEN }}
+          REPLAY: ${{ matrix.replay }}
+        run: |
+          IFS=/ read -r org project target run <<<"$REPLAY"
+          d="$RUNNER_TEMP/crashers" && mkdir -p "$d"
+          # to a file, not piped: tar stops at the end-of-archive marker, Mayhem pads past it, and under
+          # pipefail the unread padding fails curl with 23; a piped --retry would also feed tar a second copy
+          curl -fsSL --retry 3 -H "X-Mayhem-Token: token $MAYHEM_TOKEN" -o "$RUNNER_TEMP/crashers.tar" \
+            "https://app.mayhem.security/api/v2/owner/$org/project/$project/target/$target/testsuite.tar?run_number=$run&defects_only=true"
+          tar -x -C "$d" -f "$RUNNER_TEMP/crashers.tar"
+          n=0
+          for f in "$d"/*; do
+            [ -f "$f" ] || continue
+            [ "$(sha256sum < "$f" | cut -c1-64)" = "${f##*/}" ] || { echo "::error::${f##*/} does not hash to its name"; exit 1; }
+            n=$((n + 1))
+          done
+          [ "$n" -gt 0 ] || { echo "::error::no crashing test cases in $REPLAY"; exit 1; }
+          echo "$n crashing test case(s) from https://app.mayhem.security/$REPLAY"
+      - name: Name the target ${{ matrix.target }}
+        if: ${{ matrix.replay }}
+        id: mf
+        shell: bash
+        env:
+          MAYHEMFILE: ${{ matrix.mayhemfile }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          # on FIX the target is <tgt>-fixed-<BASE7>: rewrite a copy on the runner, never the branch's
+          f="$RUNNER_TEMP/Mayhemfile" && sed -E "s/^([[:space:]]*target:[[:space:]]*)\"?[^\"[:space:]]+\"?/\1$TARGET/" "$MAYHEMFILE" > "$f"
+          grep -qE "^[[:space:]]*target:[[:space:]]*$TARGET\$" "$f" || { echo "::error::could not name the target $TARGET"; exit 1; }
+          echo "file=$f" >> "$GITHUB_OUTPUT"
+      - name: Replay them on the ${{ inputs.image || 'base' }} image (${{ matrix.target }})
+        if: ${{ matrix.replay }}
+        uses: ForAllSecure/mcode-action@08516a896b38a6d4955bceb640c21908ec0c416b # v1.0.12
+        with:
+          mayhem-token: ${{ secrets.MAYHEM_TOKEN }}
+          args: --image ${{ needs.build-fix.outputs.image || needs.build.outputs.image }} --file ${{ steps.mf.outputs.file }} --testsuite file://${{ runner.temp }}/crashers --regression
